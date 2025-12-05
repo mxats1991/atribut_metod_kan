@@ -70,13 +70,8 @@ def load_subject_npz(sub_id, data_dir=DATA_DIR, sessions=SESSIONS):
             else:
                 channels = list(map(str, chs))
         if fs is None and 'fs' in data:
-            try:
-                fs = float(data['fs'].tolist())
-            except Exception:
-                try:
-                    fs = float(data['fs'])
-                except Exception:
-                    fs = DEFAULT_FS
+            fs = float(data['fs'].tolist())
+           
 
     if len(X_list) == 0:
         return None, None, None, None
@@ -132,9 +127,7 @@ def extract_feature_scores_from_model(model, expected_len):
                     cand = attr
                     break
 
-    if cand is None:
-        logger.warning("No explicit feature_score tensor found on model. Returning zeros.")
-        return np.zeros(expected_len, dtype=np.float32)
+
 
     arr = cand.detach().cpu().numpy().reshape(-1)
     if arr.size != expected_len:
@@ -156,9 +149,7 @@ def run_for_subject(sub_id):
 
     X = np.asarray(X)
     y = np.asarray(y).reshape(-1)
-    if X.ndim != 3:
-        logger.error(f"Unexpected X shape for subject {sub_id:02d}: {X.shape}")
-        return None
+
 
     n_epochs, n_channels, n_times = X.shape
     logger.info(f"Subject {sub_id:02d}: epochs={n_epochs}, channels={n_channels}, samples={n_times}, fs={fs}")
@@ -179,13 +170,9 @@ def run_for_subject(sub_id):
     y_mapped = np.array([label_map[lab] for lab in y], dtype=int)
 
     stratify = y_mapped if len(y_unique) > 1 else None
-    try:
-        X_tr, X_val, y_tr, y_val = train_test_split(X_flat, y_mapped, test_size=TEST_SIZE,
+    X_tr, X_val, y_tr, y_val = train_test_split(X_flat, y_mapped, test_size=TEST_SIZE,
                                                     random_state=RANDOM_STATE, stratify=stratify)
-    except Exception as e:
-        logger.warning(f"Stratified split failed ({e}), doing random split.")
-        X_tr, X_val, y_tr, y_val = train_test_split(X_flat, y_mapped, test_size=TEST_SIZE,
-                                                    random_state=RANDOM_STATE, stratify=None)
+   
 
     from sklearn.preprocessing import StandardScaler
     scaler = StandardScaler()
@@ -253,10 +240,8 @@ def run_for_subject(sub_id):
     logger.info(f"Subject {sub_id:02d} metrics: acc={acc:.4f}, prec={prec:.4f}, rec={rec:.4f}, f1={f1:.4f}")
 
     feat_scores_1d = extract_feature_scores_from_model(model, expected_len=input_dim)
-    try:
-        feat_scores_mat = feat_scores_1d.reshape(n_channels, n_bands)
-    except Exception:
-        feat_scores_mat = np.zeros((n_channels, n_bands), dtype=np.float32)
+    feat_scores_mat = feat_scores_1d.reshape(n_channels, n_bands)
+   
 
     channel_scores = np.sum(np.abs(feat_scores_mat), axis=1)
 
@@ -321,7 +306,6 @@ def main():
     df_metrics.to_csv(metrics_csv, index=False)
     logger.info(f"Saved metrics -> {metrics_csv}")
 
-    logger.info(f"Experiment finished. Subjects processed: {processed}/{len(SUBJECTS)}")
 
 
 if __name__ == "__main__":

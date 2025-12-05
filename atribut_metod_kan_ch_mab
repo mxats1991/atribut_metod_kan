@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""
+Classification pipeline for EEG electrode configurations using KAN.
+"""
+
+import os
+import json
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from tqdm import tqdm, trange
+import matplotlib.pyplot as plt
+import seaborn as sns
+import logging
+
+from scipy import signal
+from sklearn.preprocessing import StandardScaler, label_binarize
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix, roc_curve, auc
+from sklearn.model_selection import train_test_split
+
+import torch
+from kan import KAN
+
+NPZ_DIR = Path("/content/drive/MyDrive/data_npz")
+OUT_DIR = Path("results_kan_verbose")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("DEVICE ->", DEVICE)
+
+BANDS = {
+    "Theta": (4, 8),
+    "Alpha": (8, 13),
+    "Beta": (13, 30),
+    "Gamma": (30, 45)
+}
+
+TRAIN_STEPS = 50
+LR = 1e-3
+
+CONFIGS = {
+    "ours_10": ["FC4","CP6","TP10","C3","FC3","FC5","CP3","C4","F4","P5"],
+    "ours_9": ["FC4","CP6","TP10","C3","FC3","FC5","CP3","C4","F4"],
+    "ours_5": ["FC4","CP6","TP10","C3","FC3"],
+    "lee_opt2": ["F3","F4"],
+    "lee_opt4": ["AF3","AF4","FC5","FC6"],
+    "lee_opt6": ["FC5","FC6","C3","C4","P7","P8"],
+    "lee_opt8": ["F3","F4","FC5","FC6","C3","C4","P7","P8"],
+    "sr_ocl4": ["PO7","PO3","PO4","PO8"],
+    "sr_pll4": ["CP1","CP2","CP6","P4"],
+    "sr_prl3": ["Fp2","AF3","F8"],
+    "sr_opl8": ["PO7","PO3","PO4","PO8","CP1","CP2","CP6","P4"],
+    "sr_opl7": ["PO7","PO3","PO4","PO8","Fp2","AF3","F8"],
+    "sns_att4": ["Fz","Pz","Cz","Oz"],
+    "sns_em2": ["F7","F8"],
+    "sns_em4": ["F7","F8","AF3","AF4"],
+    "sns_gp6": ["AF3","AF4","Fz","Cz","P3","P4"],
+    "sns_gp8": ["AF3","AF4","Fz","Cz","P3","P4","FC5","FC6"],
+}
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("KAN_PIPELINE")
+
+
+def load_subject_npz(sub_id, npz_dir=NPZ_DIR):
+    X_list = []
+    y_list = []
+    channels = None
+    fs = None
+    for s in [1,2,3]:
+        p = npz_dir / f"sub-{sub_id:02d}_S{s}.npz"
+        if not p.exists():
+            continue
+        data = np.load(p, allow_pickle=True)
+        if 'X' not in data or 'y' not in data:
+            logger.warning(f"NPZ {p} missing X or y.")
+            continue
+        X_list.append(data['X'])
+        y_list.append(data['y'])
+        if channels is None and 'channels' in data:
+            channels = np.array(data['channels'])
+        if fs is None and 'fs' in data:
+            try:
+                fs = float(data['fs'])
+            except:
+                fs = 100.0
+    if len(X_list) == 0:
+        return None, None, None, None
+    X = np.concatenate(X_list, axis=0)
+    y = np.concatenate(y_list, axis=0)
+    return X, y, channels, (fs if fs is not None else 100.0)
+
+
+def compute_logmean_psd_epochs(X, fs, bands=BANDS, nperseg=256):
+    n_epochs, n_channels, n_times = X.shape
+    band_items = list(bands.items())
+    n_bands = len(band_items)
+    out = np.zeros((n_epochs, n_channels, n_bands), dtype=np.float32)
+    use_nperseg = min(nperseg, n_times)
+    for e in range(n_epochs):
+        for ch in range(n_channels):
+            f, pxx = signal.welch(X[e, ch, :], fs=fs, nperseg=use_nperseg)
+            pxx_log = np.log(pxx + 1e-12)
+            for bi, (_, (low, high)) in enumerate(band_items):
+                mask = (f >= low) & (f <= high)
+                if np.any(mask):
+                    out[e, ch, bi] = float(np.mean(pxx_log[mask]))
+                else:
+                    out[e, ch, bi] = 0.0
+    return out
+
+
+def build_feature_matrix_for_config(X, channels_all, selected_channels, fs):
+    ch_names = [c for c in channels_all.astype(str)]
+    idxs = []
+    for ch in selected_channels:
+        if ch in ch_names:
+            idxs.append(ch_names.index(ch))
+        else:
+            logger.warning(f"Channel {ch} not found in this subject; skipping it.")
+    if len(idxs) == 0:
+        return None, 0, []
+    Xsel = X[:, idxs, :]
+    feats = compute_logmean_psd_epochs(Xsel, fs)
+    n_epochs, n_ch, n_bands = feats.shape
+    Xflat = feats.reshape(n_epochs, n_ch * n_bands)
+    band_names = list(BANDS.keys())
+    return Xflat, n_ch, band_names
+
+
+def plot_and_save_confmat(y_true, y_pred, out_path):
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(4,4))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    plt.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_and_save_roc_multiclass(y_true, y_score, class_names, out_path):
+    n_classes = y_score.shape[1]
+    y_true_bin = label_binarize(y_true, classes=list(range(n_classes)))
+    plt.figure(figsize=(6,5))
+    for i in range(n_classes):
+        fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_score[:, i])
+        roc_auc = auc(fpr, tpr)
+        plt.plot(fpr, tpr, lw=2, label=f"{class_names[i]} (AUC={roc_auc:.2f})")
+    fpr_micro, tpr_micro, _ = roc_curve(y_true_bin.ravel(), y_score.ravel())
+    auc_micro = auc(fpr_micro, tpr_micro)
+    plt.plot(fpr_micro, tpr_micro, linestyle='--', color='k', label=f"micro (AUC={auc_micro:.2f})")
+    plt.plot([0,1],[0,1], color='gray', linestyle=':')
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC (one-vs-rest)")
+    plt.legend(loc='lower right', fontsize='small')
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def train_with_pykan_fit_if_possible(model, dataset_dict, steps, lr, loss_fn):
+    try:
+        res = model.fit(dataset_dict, steps=steps, lr=lr, loss_fn=loss_fn, opt="Adam")
+        return res
+    except TypeError:
+        try:
+            res = model.fit(
+                dataset_dict['train_input'],
+                dataset_dict['train_label'],
+                dataset_dict['test_input'],
+                dataset_dict['test_label'],
+                steps=steps, lr=lr
+            )
+            return res
+        except Exception as e:
+            logger.debug("pykan.fit signature fallback failed: %s" % e)
+            return None
+    except Exception as e:
+        logger.debug("pykan.fit raised exception: %s" % e)
+        return None
+
+
+def manual_train_model(model, Xtr_t, ytr_t, Xte_t, yte_t, epochs=TRAIN_STEPS, lr=LR):
+    model.to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = torch.nn.CrossEntropyLoss()
+    history = {'train_loss': [], 'val_loss': []}
+    for ep in trange(epochs, desc="Epochs", leave=False):
+        model.train()
+        optimizer.zero_grad()
+        out = model(Xtr_t)
+        loss = loss_fn(out, ytr_t)
+        loss.backward()
+        optimizer.step()
+        train_loss = loss.item()
+        model.eval()
+        with torch.no_grad():
+            out_val = model(Xte_t)
+            val_loss = loss_fn(out_val, yte_t).item()
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        if (ep % max(1, epochs // 5)) == 0:
+            tqdm.write(f"  epoch {ep}/{epochs} train_loss={train_loss:.4f} val_loss={val_loss:.4f}")
+    return model, history
+
+
+def run_pipeline_for_config(cfg_name, cfg_channels, subject_ids):
+    cfg_out = OUT_DIR / cfg_name
+    cfg_out.mkdir(parents=True, exist_ok=True)
+    metrics_rows = []
+
+    for sub_id in tqdm(subject_ids, desc=f"Config {cfg_name}", leave=True):
+        X, y, channels_all, fs = load_subject_npz(sub_id)
+        if X is None:
+            logger.warning(f"Subject {sub_id} missing — skipping.")
+            continue
+
+        Xflat, n_ch_used, band_names = build_feature_matrix_for_config(X, channels_all, cfg_channels, fs)
+        if Xflat is None:
+            logger.warning(f"Config {cfg_name} has 0 channels for subject {sub_id} — skipping subject.")
+            continue
+
+        if np.any(np.isnan(Xflat)) or np.any(np.isinf(Xflat)):
+            Xflat = np.nan_to_num(Xflat, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        y_arr = np.array(y).astype(int).reshape(-1)
+        classes = np.unique(y_arr)
+        class_map = {v:i for i,v in enumerate(sorted(classes))}
+        y_mapped = np.array([class_map[v] for v in y_arr], dtype=int)
+        n_classes = len(classes)
+        class_names = [str(c) for c in sorted(classes)]
+
+        Xtr, Xte, ytr, yte = train_test_split(Xflat, y_mapped, test_size=0.2, random_state=42, stratify=y_mapped)
+
+        scaler = StandardScaler()
+        Xtr = scaler.fit_transform(Xtr)
+        Xte = scaler.transform(Xte)
+
+        Xtr_t = torch.tensor(Xtr, dtype=torch.float32).to(DEVICE)
+        ytr_t = torch.tensor(ytr, dtype=torch.long).to(DEVICE)
+        Xte_t = torch.tensor(Xte, dtype=torch.float32).to(DEVICE)
+        yte_t = torch.tensor(yte, dtype=torch.long).to(DEVICE)
+
+        input_dim = Xtr.shape[1]
+        width = [input_dim, input_dim*2 + 1, input_dim*2 + 1, n_classes]
+        model = KAN(width=width, grid=10, k=3, seed=42, device=DEVICE)
+
+        dataset_dict = {
+            'train_input': Xtr_t,
+            'train_label': ytr_t,
+            'test_input': Xte_t,
+            'test_label': yte_t
+        }
+
+        loss_fn = torch.nn.CrossEntropyLoss()
+        results = train_with_pykan_fit_if_possible(model, dataset_dict, steps=TRAIN_STEPS, lr=LR, loss_fn=loss_fn)
+
+        if results is None:
+            logger.info(f"pykan.fit not usable for config {cfg_name} subject {sub_id} — using manual training.")
+            model, history = manual_train_model(model, Xtr_t, ytr_t, Xte_t, yte_t, epochs=TRAIN_STEPS, lr=LR)
+
+        model.eval()
+        with torch.no_grad():
+            logits = model(Xte_t).detach().cpu().numpy()
+            probs = torch.softmax(torch.tensor(logits), dim=1).numpy() if logits.ndim>1 else np.vstack([1-logits, logits]).T
+            preds = np.argmax(logits, axis=1) if logits.ndim>1 else (logits.ravel()>0.5).astype(int)
+            y_true = yte
+
+        acc = float(accuracy_score(y_true, preds))
+        f1 = float(f1_score(y_true, preds, average='macro'))
+        try:
+            auc_score = float(roc_auc_score(label_binarize(y_true, classes=range(n_classes)), probs, average='macro', multi_class='ovr'))
+        except Exception as e:
+            logger.warning(f"ROC AUC computation failed for subj {sub_id}: {e}")
+            auc_score = float('nan')
+
+        sub_out = cfg_out / f"sub-{sub_id:02d}"
+        sub_out.mkdir(exist_ok=True, parents=True)
+
+        cm_path = sub_out / "confusion_matrix.png"
+        plot_and_save_confmat(y_true, preds, cm_path)
+
+        roc_path = sub_out / "roc_ovr.png"
+        plot_and_save_roc_multiclass(y_true, probs, class_names, roc_path)
+
+        metrics = {
+            "config": cfg_name,
+            "subject": int(sub_id),
+            "n_channels_used": int(n_ch_used),
+            "acc": acc,
+            "f1_macro": f1,
+            "auc_macro_ovr": auc_score
+        }
+        with open(sub_out / "metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+
+        metrics_rows.append(metrics)
+
+    if len(metrics_rows) > 0:
+        df_cfg = pd.DataFrame(metrics_rows)
+        df_cfg.to_csv(OUT_DIR / f"{cfg_name}_metrics_per_subject.csv", index=False)
+    else:
+        logger.warning(f"No metrics collected for config {cfg_name}.")
+
+    return
+
+
+def main():
+    subs = []
+    for p in NPZ_DIR.glob("sub-*_S1.npz"):
+        name = p.stem
+        try:
+            sid = int(name.split("_")[0].split("-")[1])
+            subs.append(sid)
+        except:
+            continue
+    subs = sorted(list(set(subs)))
+    if len(subs) == 0:
+        logger.error("No subjects found in data_npz. Exiting.")
+        return
+    logger.info(f"Found subjects: {subs}")
+
+    for cfg_name, cfg_channels in CONFIGS.items():
+        run_pipeline_for_config(cfg_name, cfg_channels, subject_ids=subs)
+
+    all_csvs = list((OUT_DIR).glob("*_metrics_per_subject.csv"))
+    df_list = []
+    for f in all_csvs:
+        try:
+            df = pd.read_csv(f)
+            cfg = f.stem.replace("_metrics_per_subject","")
+            df['config'] = cfg
+            df_list.append(df)
+        except Exception as e:
+            logger.warning(f"Failed to read {f}: {e}")
+    if len(df_list) > 0:
+        df_all = pd.concat(df_list, axis=0, ignore_index=True)
+        df_all.to_csv(OUT_DIR / "all_configs_metrics_summary.csv", index=False)
+        logger.info(f"Saved aggregated metrics at {OUT_DIR/'all_configs_metrics_summary.csv'}")
+    else:
+        logger.warning("No per-config metrics files found to aggregate.")
+
+if __name__ == "__main__":
+    main()

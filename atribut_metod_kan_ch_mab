@@ -1,7 +1,4 @@
-#!/usr/bin/env python3
-"""
-Classification pipeline for EEG electrode configurations using KAN.
-"""
+
 
 import os
 import json

@@ -161,27 +161,9 @@ def plot_and_save_roc_multiclass(y_true, y_score, class_names, out_path):
 
 
 def train_with_pykan_fit_if_possible(model, dataset_dict, steps, lr, loss_fn):
-    try:
-        res = model.fit(dataset_dict, steps=steps, lr=lr, loss_fn=loss_fn, opt="Adam")
-        return res
-    except TypeError:
-        try:
-            res = model.fit(
-                dataset_dict['train_input'],
-                dataset_dict['train_label'],
-                dataset_dict['test_input'],
-                dataset_dict['test_label'],
-                steps=steps, lr=lr
-            )
-            return res
-        except Exception as e:
-            logger.debug("pykan.fit signature fallback failed: %s" % e)
-            return None
-    except Exception as e:
-        logger.debug("pykan.fit raised exception: %s" % e)
-        return None
-
-
+    res = model.fit(dataset_dict, steps=steps, lr=lr, loss_fn=loss_fn, opt="Adam")
+    return res
+    
 def manual_train_model(model, Xtr_t, ytr_t, Xte_t, yte_t, epochs=TRAIN_STEPS, lr=LR):
     model.to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -270,12 +252,8 @@ def run_pipeline_for_config(cfg_name, cfg_channels, subject_ids):
 
         acc = float(accuracy_score(y_true, preds))
         f1 = float(f1_score(y_true, preds, average='macro'))
-        try:
-            auc_score = float(roc_auc_score(label_binarize(y_true, classes=range(n_classes)), probs, average='macro', multi_class='ovr'))
-        except Exception as e:
-            logger.warning(f"ROC AUC computation failed for subj {sub_id}: {e}")
-            auc_score = float('nan')
-
+        auc_score = float(roc_auc_score(label_binarize(y_true, classes=range(n_classes)), probs, average='macro', multi_class='ovr'))
+       
         sub_out = cfg_out / f"sub-{sub_id:02d}"
         sub_out.mkdir(exist_ok=True, parents=True)
 
@@ -311,11 +289,8 @@ def main():
     subs = []
     for p in NPZ_DIR.glob("sub-*_S1.npz"):
         name = p.stem
-        try:
-            sid = int(name.split("_")[0].split("-")[1])
-            subs.append(sid)
-        except:
-            continue
+        sid = int(name.split("_")[0].split("-")[1])
+        subs.append(sid)
     subs = sorted(list(set(subs)))
     if len(subs) == 0:
         logger.error("No subjects found in data_npz. Exiting.")
@@ -328,19 +303,16 @@ def main():
     all_csvs = list((OUT_DIR).glob("*_metrics_per_subject.csv"))
     df_list = []
     for f in all_csvs:
-        try:
-            df = pd.read_csv(f)
-            cfg = f.stem.replace("_metrics_per_subject","")
-            df['config'] = cfg
-            df_list.append(df)
-        except Exception as e:
-            logger.warning(f"Failed to read {f}: {e}")
+        df = pd.read_csv(f)
+        cfg = f.stem.replace("_metrics_per_subject","")
+        df['config'] = cfg
+        df_list.append(df)
+       
     if len(df_list) > 0:
         df_all = pd.concat(df_list, axis=0, ignore_index=True)
         df_all.to_csv(OUT_DIR / "all_configs_metrics_summary.csv", index=False)
         logger.info(f"Saved aggregated metrics at {OUT_DIR/'all_configs_metrics_summary.csv'}")
-    else:
-        logger.warning("No per-config metrics files found to aggregate.")
+
 
 if __name__ == "__main__":
     main()
